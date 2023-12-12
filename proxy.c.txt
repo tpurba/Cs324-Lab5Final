@@ -1,0 +1,576 @@
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <asm-generic/socket.h>
+#include <netdb.h>
+#include<fcntl.h>
+#include<errno.h>
+#include<sys/epoll.h>
+/* Recommended max object size */
+#define MAX_OBJECT_SIZE 102400
+#define MAX_EVENTS 10
+#define BUF_SIZE 500
+#define BIG_SIZE 3000
+#define READ_REQUEST 1
+#define SEND_REQUEST 2
+#define READ_RESPONSE 3
+#define SEND_RESPONSE 4
+struct request_info{
+//  the client-to-proxy socket, i.e., the one corresponding to the requesting client
+    int client_proxySock;
+// the proxy-to-server socket, i.e., the one corresponding to the connection to the HTTP server
+    int proxy_serverSock;
+// the current state of the request (see note below).
+    int state;
+// the buffer(s) to read into and write from 
+    char buf[BIG_SIZE];
+// the buffer for server response 
+    char server_buf[MAX_OBJECT_SIZE];
+// the total number of bytes read from the client
+    ssize_t bytes_read_fromClient;
+// the total number of bytes to write to the server
+    ssize_t bytes_write_toServer;
+// the total number of bytes written to the server
+    ssize_t bytes_written_toServer;
+// the total number of bytes read from the server
+    ssize_t bytes_read_fromServer;
+// the total number of bytes written to the client
+    ssize_t bytes_written_toClient;
+};
+static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:97.0) Gecko/20100101 Firefox/97.0";
+int complete_request_received(char *);
+int parse_request(char *, char *, char *, char *, char *);
+void test_parser();
+void print_bytes(unsigned char *, int);
+int open_sfd(int port);
+void handle_new_clients(int fd);
+void handle_client(struct request_info*);
+//global values 
+int efd;
+ssize_t bytes_received_server = 0;
+int main(int argc, char *argv[])
+{
+    //test_parser();
+    //create epoll
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    if ((efd = epoll_create1(0)) < 0) {
+        perror("Error with epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+    int sfd = open_sfd(atoi(argv[1]));
+    struct request_info *request = malloc(sizeof(struct request_info));
+    request->client_proxySock = sfd; //ADD REQUEST
+    event.data.ptr = request;
+    event.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event) < 0) {
+        fprintf(stderr, "error adding event\n");
+        exit(EXIT_FAILURE);
+    }
+    int num_events;
+    struct epoll_event events[MAX_EVENTS];
+    while(1){
+        num_events = epoll_wait(efd, events, MAX_EVENTS, 1000);  // 1000 milliseconds = 1 second
+        //printf("number of events: %d\n", num_events);
+        if (num_events == -1) {//error
+            perror("epoll_wait");
+            
+            exit(EXIT_FAILURE);
+        } else if (num_events == 0) {// Timeout occurred
+            //printf("Timeout occurred\n");
+        } else {
+            for (int i = 0; i < num_events; i++) {
+                //printf("In main for loop\n");
+                // if (events[i].events & EPOLLIN) {//checks if the data is associated with a Epollin flag
+                    struct request_info *request = (struct request_info*) (events[i].data.ptr); 
+                    if (request->client_proxySock == sfd) { 
+                        //if event fd is same as sfd(listening socket) 
+                        //then that means that it is a new connection
+                        handle_new_clients(sfd);
+                    } else {
+                        //printf("going to handle client\n");
+                        // It's an existing client, so handle it accordingly.
+                        handle_client(request);
+                    }
+                //}
+            }
+        }
+    }
+    printf("%s\n", user_agent_hdr);//MAYBE
+    free(request);
+    return 0;
+}
+int complete_request_received(char *request) {
+    char *result = strstr(request, "\r\n\r\n");
+      if (result != NULL) {
+        //printf("Found the end of the request\n");
+        return 1;
+    } else {
+        //printf("Did not find the end of request\n");
+        return 0;
+    }
+}
+int parse_request(char *request, char *method,
+        char *hostname, char *port, char *path) {
+    //check if the request is proper if not then return zero
+    int result = complete_request_received(request);
+    if(result != 0 ){
+        //find method 
+        char *beginning_of_thing = request;
+        char *end_of_thing = strstr(beginning_of_thing, " ");
+        strncpy(method, beginning_of_thing, end_of_thing - beginning_of_thing);
+        method[end_of_thing - beginning_of_thing] = '\0'; 
+        beginning_of_thing = end_of_thing + 1;
+        //get the URL
+        end_of_thing = strstr(beginning_of_thing, " ");
+        size_t url_length = end_of_thing - beginning_of_thing;
+        char url[100];
+        strncpy(url, beginning_of_thing, url_length);
+        url[url_length] = '\0';
+        //printf("URL: %s\n", url);
+        beginning_of_thing = end_of_thing + 1;
+        //in URL increment past the http://
+        beginning_of_thing = strstr(url, "/");//find the :// in url
+        beginning_of_thing = beginning_of_thing + 2;
+        char *portExists = strchr(beginning_of_thing, ':');//see if there is a second : for port 
+        if (portExists != NULL) {
+            //find the host 
+            end_of_thing = strstr(beginning_of_thing, ":");
+            size_t host_length = end_of_thing - beginning_of_thing;
+            strncpy(hostname, beginning_of_thing, host_length);
+            hostname[host_length] = '\0';
+            beginning_of_thing = end_of_thing + 1;
+            //find port
+            end_of_thing = strstr(beginning_of_thing, "/");
+            size_t port_length = end_of_thing - beginning_of_thing;
+            strncpy(port, beginning_of_thing, port_length);
+            port[port_length] = '\0';
+            beginning_of_thing = end_of_thing;
+            strcpy(path, beginning_of_thing);
+        } else {
+            //find the host 
+            end_of_thing = strstr(beginning_of_thing, "/");
+            size_t host_length = end_of_thing - beginning_of_thing;
+            strncpy(hostname, beginning_of_thing, host_length);
+            hostname[host_length] = '\0';
+            strcpy(port, "80");
+            beginning_of_thing = end_of_thing;
+            strcpy(path, beginning_of_thing);
+        }
+    }
+    return result;
+}
+int open_sfd(int port){ //opens the proxy
+    //printf("IN open_sfd\n");
+    int pfd;
+    if ((pfd = socket(AF_INET, SOCK_STREAM, 0)) < -1) {
+        perror("Error creating socket");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Set up the server address struct
+    struct sockaddr_in server_address;
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = INADDR_ANY; // Accept connections from any address
+    server_address.sin_port = htons(port);
+    //allow binding to a port that is already in use 
+    int optval = 1;
+    if (setsockopt(pfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
+        perror("Error setting SO_REUSEPORT");
+        close(pfd);
+        exit(EXIT_FAILURE);
+    }
+    if (fcntl(pfd, F_SETFL, fcntl(pfd, F_GETFL, 0) | O_NONBLOCK) < 0) //make socket non blocking
+    {
+        fprintf(stderr, "error setting socket option\n");
+        exit(1);
+    }
+    //bind 
+    if (bind(pfd, (struct sockaddr*)&server_address, sizeof(server_address) ) == -1) {
+        perror("Could not bind");
+        exit(EXIT_FAILURE);
+    }
+    if (listen(pfd, 10) == -1) {
+        perror("Error listening for connections");
+        close(pfd);
+        exit(EXIT_FAILURE);
+    }
+    //printf("Server listening on port %d...\n", port);
+    return pfd;
+}
+void handle_new_clients(int fd){
+    //printf("In handle new client function\n");
+    struct sockaddr_in remote_addr_in;
+    struct sockaddr *remote_addr;
+    char remote_addr_str[INET6_ADDRSTRLEN];
+    remote_addr = (struct sockaddr *)&remote_addr_in;
+    socklen_t addr_len = sizeof(struct sockaddr_storage);
+    while(1){
+        int connfd = accept(fd, remote_addr, &addr_len);
+        //printf("connfd: %d\n", connfd);
+        //check if accept returns value less than 0
+        if (connfd < 0) {
+            if ((errno == EWOULDBLOCK) ||(errno == EAGAIN)) {
+                //printf("Errono was EWOULDBLOCK or EAGAIN\n");
+                // no more clients ready to accept
+                break;
+            } else {
+                perror("accept");
+                exit(EXIT_FAILURE);
+            }
+        }
+        remote_addr_in = *(struct sockaddr_in *)remote_addr;
+        inet_ntop(AF_INET, &remote_addr_in.sin_addr,
+                remote_addr_str, INET6_ADDRSTRLEN);
+        //unsigned short remote_port = ntohs(remote_addr_in.sin_port);
+        
+        //set connfd to non blocking 
+        if (fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK) < 0) 
+        {
+            fprintf(stderr, "error setting socket option\n");
+            exit(1);
+        }
+        //printf("New connectionon %d: %s:%d\n", connfd, remote_addr, remote_port);
+        //Allocate memory for a new struct 
+        //request_info and initialize the values in that struct request_info. 
+        //The initial state should be READ_REQUEST.
+        struct request_info *request = malloc(sizeof(struct request_info));
+        request->client_proxySock = connfd; //ADD REQUEST
+        request->state = READ_REQUEST; //ADD REQUEST
+        //initalize the rest
+        request->proxy_serverSock = 0;
+        request->bytes_read_fromClient = 0;
+        request->bytes_write_toServer = 0;
+        request->bytes_written_toClient = 0;
+        request->bytes_read_fromServer = 0;
+        request->bytes_written_toClient = 0;
+        
+        // Set up the epoll event
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET;
+        event.data.ptr = request; // Associate the struct request_info with the event
+        //printf("sending a new epoll\n");
+        // Register the client-to-proxy socket with epoll
+        if (epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &event) < 0) {
+            perror("epoll_ctl");
+            exit(EXIT_FAILURE);
+        }
+    }
+    //printf("returning\n");
+    return;
+}
+void handle_client(struct request_info* request){
+    // printf("File descriptor of client to proxy socket: %d \n current state: %d\n"
+    // ,request->client_proxySock, request->state);
+    char method[16], hostname[64], port[8], path[64];
+    char wholeRequest[500];
+    int startPoint = 0;
+    ssize_t bytes_received;
+    char buf[BUF_SIZE];
+    char server_request[8192];  // Adjust the buffer size as needed
+    if(request->state == READ_REQUEST){
+        //ADDING REQUEST
+        while ((bytes_received = recv(request->client_proxySock, buf, sizeof(buf), 0)) > 0) 
+        {
+            //printf("bytes_recieved: %ld\n", bytes_received);
+            // Check if the entire HTTP request has been received (end of headers)
+            char *end_of_headers = strstr(buf, "\r\n\r\n");
+            //print_bytes(buf, bytes_received);
+            memcpy(wholeRequest + startPoint, buf, bytes_received);
+            memcpy(request->buf + request->bytes_read_fromClient, buf, bytes_received);
+            startPoint += bytes_received;
+            request->bytes_read_fromClient = startPoint;
+            if (end_of_headers != NULL) {
+                //printf("end of headers found\n");
+                // Entire HTTP request headers have been received
+                break;
+            }
+        }
+		if(bytes_received < 0){
+                if ((errno == EWOULDBLOCK) ||(errno == EAGAIN)){
+                    //printf("IN ERRNO of READ REQUEST while reading client to proxy\n");
+					return;
+                }
+                else{
+                    perror("Error when trying to read bytes from client to proxy");
+                    close(request->client_proxySock);
+                    free(request);
+                    return;
+                }
+        	}
+        // Add null-terminator to the HTTP request
+        wholeRequest[startPoint] = '\0';
+        if(wholeRequest == NULL){
+            //printf("whole request is EMPTY \n");
+        }
+        //printf("PrintBytes output: ");
+        //print_bytes(wholeRequest, startPoint);
+        //printf("What we got from the whole request: %s\n", wholeRequest);
+        //printf("What we have so far from request recv from client: %s\n", request->buf);
+        request->bytes_read_fromClient = startPoint;//ADDING REQUEST
+        parse_request(request->buf, method, hostname, port, path); 
+        // printf("Test METHOD: %s\n", method);
+        // printf("Test HOSTNAME: %s\n", hostname);
+        // printf("Test PORT: %s\n", port);
+        // printf("Test PATH: %s\n", path);
+        
+        int server_request_size = snprintf(server_request, sizeof(server_request),
+                "%s %s HTTP/1.0\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Connection: \r\n"
+                "Proxy-Connection: \r\n"
+                "\r\n",
+                method, path, hostname, user_agent_hdr);
+        //printf("PrintBytes output for Server request: ");
+        //print_bytes(server_request, server_request_size);
+        //printf("What we will be sending to the server: %s\n", server_request);
+        request->bytes_write_toServer = server_request_size; //ADDING REQUEST
+        //get addrinfo
+        struct addrinfo hints, *server_info;
+        memset(&hints, 0, sizeof(struct addrinfo));
+        hints.ai_family = AF_INET;    
+        hints.ai_socktype = SOCK_STREAM; 
+        hints.ai_flags = 0;
+        hints.ai_protocol = 0;  /* Any protocol */
+        if (getaddrinfo(hostname, port, &hints, &server_info) != 0) {
+            perror("Error getting server address info");
+            close(request->client_proxySock);
+            return;
+        }
+        //socket
+        int sfd = socket(server_info->ai_family, server_info->ai_socktype, server_info->ai_protocol);
+        if (sfd == -1) {
+            perror("Error creating server socket");
+            freeaddrinfo(server_info);
+            close(request->client_proxySock);
+            return;
+        }
+        //connect
+        if (connect(sfd, server_info->ai_addr, server_info->ai_addrlen) == -1) {
+            perror("Error connecting to the server");
+            freeaddrinfo(server_info);
+            close(request->client_proxySock);
+            close(sfd);
+            freeaddrinfo(server_info);
+            return;
+        }
+        //set sfd as non blocking
+        if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+                        fprintf(stderr, "error setting socket option\n");
+                        exit(1);
+        }
+        // closing the fd will automatically
+        // unregister the fd from the efd
+        if (epoll_ctl(efd, EPOLL_CTL_DEL, request->client_proxySock, NULL) == -1) {
+            perror("Error modifying EPOLL_CTL_MOD for proxy-to-server socket");
+            exit(EXIT_FAILURE);
+        }
+        struct epoll_event event;
+        event.events = EPOLLOUT;
+        request->proxy_serverSock = sfd; //ADD REQUEST
+        event.data.ptr = request;
+        if (epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event) == -1) {
+        perror("Error adding EPOLLOUT event to epoll");
+        exit(EXIT_FAILURE);
+        }
+        request->state = SEND_REQUEST;//ADD REQUEST
+    }
+    else if(request->state == SEND_REQUEST){
+        //printf("In send request\n");
+        //loop to write to server using the proxy ot server socket
+        while(1){
+            ssize_t bytes_sent_client = send(request->proxy_serverSock, server_request, strlen(server_request), 0); 
+            //printf("Bytes sent: %ld\n", bytes_sent_client);
+            request->bytes_written_toServer = bytes_sent_client; //ADD REQUEST
+            //printf("Bytes in server request: %ld\n", request->bytes_write_toServer);
+            if(bytes_sent_client == request->bytes_write_toServer){
+                //printf("Written all the bytes to the server\n");
+                // Unregister the proxy-to-server socket with the epoll instance for writing
+                struct epoll_event modify_event;
+                modify_event.data.ptr = request;
+                modify_event.events = EPOLLIN;
+                if (epoll_ctl(efd, EPOLL_CTL_MOD, request->proxy_serverSock, &modify_event) == -1) {
+                    perror("Error modifying EPOLL_CTL_MOD for proxy-to-server socket");
+                    exit(EXIT_FAILURE);
+                }
+                // Register the proxy-to-server socket with the epoll instance for reading
+                modify_event.events = EPOLLIN | EPOLLET;
+                if (epoll_ctl(efd, EPOLL_CTL_MOD, request->proxy_serverSock, &modify_event) == -1) {
+                    perror("Error modifying EPOLL_CTL_MOD for proxy-to-server socket");
+                    exit(EXIT_FAILURE);
+                }
+                request->state = READ_RESPONSE;//ADD REQUEST
+                break;
+            }
+            else if(bytes_sent_client < 0){
+                if(errno == EAGAIN || errno == EWOULDBLOCK){
+                    //it just means that there is no buffer 
+                    //space available for writing to the socket; you will continue 
+                    //writing to the socket when you are notified by epoll that there is more 
+                    //buffer space available for writing.
+                    break;
+                }
+                else{
+                    perror("Error occured when sending request to server in handle_ client\n");
+                    close(request->client_proxySock);
+                    close(request->proxy_serverSock);
+                    free(request);
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }   
+    } 
+    else if(request->state == READ_RESPONSE)
+    {
+        
+        char server_response[MAX_OBJECT_SIZE];
+        char buffer[BUF_SIZE];
+        while((bytes_received_server = recv(request->proxy_serverSock, buffer, sizeof(buffer), 0)) > 0) {
+            //printf("bytes_recieved Server: %ld\n", bytes_received_server);
+            //print_bytes(server_response, bytes_received_server);
+            memcpy(server_response + request->bytes_read_fromServer, buffer, bytes_received_server);
+            memcpy(request->server_buf + request->bytes_read_fromServer, buffer, bytes_received_server); 
+            request->bytes_read_fromServer += bytes_received_server;
+        }
+        //printf("LAST bytes_recieved Server: %ld\n", bytes_received_server);
+        if (bytes_received_server == 0) {
+            //printf("Reached the end of the recv\n");
+            close(request->proxy_serverSock);
+            //printf("Printing it in printBytes: ");
+            //print_bytes(server_response, request->bytes_read_fromServer);
+            //printf("Printing final HTTP response recieved: %s\n", server_response);
+            //printf("Printing final HTTP response recieved in REQUEST->: %s\n", request->server_buf);
+            //register for instance in writing
+            struct epoll_event newEvent;
+            newEvent.events = EPOLLOUT;
+            newEvent.data.ptr = request;  // Assuming request is a pointer to your struct request_info
+            //printf("Creating epoll\n");
+            if (epoll_ctl(efd, EPOLL_CTL_ADD, request->client_proxySock, &newEvent) == -1) {
+                perror("Error adding EPOLLOUT event to epoll");
+                exit(EXIT_FAILURE);
+            }
+            request->state = SEND_RESPONSE;
+        }
+        if (bytes_received_server < 0) 
+        {
+            if(errno == EAGAIN || errno == EWOULDBLOCK){
+                //printf("in the errno in Read response\n");
+                //will add in later 
+            }
+            else{
+                perror("Bytes < 0 error in Read_response handle client");
+                close(request->client_proxySock);
+                close(request->proxy_serverSock);
+                free(request);
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    else if(request->state == SEND_RESPONSE){
+        int totalBytesSent = 0;
+        while(1){
+            ssize_t bytes_sent_ToClient = send(request->client_proxySock, request->server_buf, request->bytes_read_fromServer, 0);
+            totalBytesSent += bytes_sent_ToClient;
+            if(totalBytesSent == request->bytes_read_fromServer){
+                close(request->client_proxySock);
+                close(request->proxy_serverSock);
+                free(request);
+                //printf("We did it!!!!\n");
+                break;
+            }
+            if(bytes_sent_ToClient < 0){
+                if(errno == EAGAIN || errno == EWOULDBLOCK){
+                    break;//MAYBE
+                }
+                else{
+                     perror("An error has occured in read response: ");
+                    close(request->client_proxySock);
+                    close(request->proxy_serverSock);
+                    free(request);
+                    exit(EXIT_FAILURE);
+                }
+                
+
+            }
+        }
+        
+    }
+    //printf("Returning\n");
+    return;
+}
+void test_parser() {
+    int i;
+    char method[16], hostname[64], port[8], path[64];
+        char *reqs[] = {
+        "GET http://www.example.com/index.html HTTP/1.0\r\n"
+        "Host: www.example.com\r\n"
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0\r\n"
+        "Accept-Language: en-US,en;q=0.5\r\n\r\n",
+        "GET http://www.example.com:8080/index.html?foo=1&bar=2 HTTP/1.0\r\n"
+        "Host: www.example.com:8080\r\n"
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0\r\n"
+        "Accept-Language: en-US,en;q=0.5\r\n\r\n",
+        "GET http://localhost:1234/home.html HTTP/1.0\r\n"
+        "Host: localhost:1234\r\n"
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0\r\n"
+        "Accept-Language: en-US,en;q=0.5\r\n\r\n",
+        "GET http://www.example.com:8080/index.html HTTP/1.0\r\n",
+        NULL
+    };
+    
+    for (i = 0; reqs[i] != NULL; i++) {
+        printf("Testing %s\n", reqs[i]);
+        if (parse_request(reqs[i], method, hostname, port, path)) {
+            printf("T METHOD: %s\n", method);
+            printf("T HOSTNAME: %s\n", hostname);
+            printf("T PORT: %s\n", port);
+            printf("T PATH: %s\n", path);
+        } else {
+            printf("REQUEST INCOMPLETE\n");
+        }
+    }
+}
+void print_bytes(unsigned char *bytes, int byteslen) {
+    int i, j, byteslen_adjusted;
+    if (byteslen % 8) {
+        byteslen_adjusted = ((byteslen / 8) + 1) * 8;
+    } else {
+        byteslen_adjusted = byteslen;
+    }
+    for (i = 0; i < byteslen_adjusted + 1; i++) {
+        if (!(i % 8)) {
+            if (i > 0) {
+                for (j = i - 8; j < i; j++) {
+                    if (j >= byteslen_adjusted) {
+                        printf("  ");
+                    } else if (j >= byteslen) {
+                        printf("  ");
+                    } else if (bytes[j] >= '!' && bytes[j] <= '~') {
+                        printf(" %c", bytes[j]);
+                    } else {
+                        printf(" .");
+                    }
+                }
+            }
+            if (i < byteslen_adjusted) {
+                printf("\n%02X: ", i);
+            }
+        } else if (!(i % 4)) {
+            printf(" ");
+        }
+        if (i >= byteslen_adjusted) {
+            continue;
+        } else if (i >= byteslen) {
+            printf("   ");
+        } else {
+            printf("%02X ", bytes[i]);
+        }
+    }
+    printf("\n");
+}
